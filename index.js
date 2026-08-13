@@ -110,6 +110,10 @@ function processSale(event) {
 
     if (!buyer || !collection) return;
 
+    const eth = getEthValue(payload);
+    // Ignore dust buys at or under the ETH floor
+    if (eth <= MIN_ETH_PER_NFT) return;
+
     const key = `${buyer}-${collection}`;
     const now = Date.now();
 
@@ -118,10 +122,6 @@ function processSale(event) {
     }
 
     const entry = sweeps.get(key);
-
-    const eth = getEthValue(payload);
-    // Ignore dust buys at or under the ETH floor
-    if (eth <= MIN_ETH_PER_NFT) return;
 
     const usd = getUsdValue(payload);
     entry.sales.push({
