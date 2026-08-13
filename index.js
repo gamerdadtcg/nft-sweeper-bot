@@ -6,7 +6,7 @@ const fetch = require('node-fetch');
 
 // ========== CONFIG ==========
 const MIN_NFTS = 10;
-const MIN_USD = 20;
+const MIN_ETH_PER_NFT = 0.0005; // only count buys worth more than this (ETH)
 const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const ALERT_COOLDOWN = 5 * 60 * 1000; // 5 min cooldown
 
@@ -27,13 +27,52 @@ async function updateEthPrice() {
   }
 }
 
+function getSaleAmount(payload) {
+  const price = payload.sale_price || payload.total_price || payload.base_price || '0';
+  const decimals = payload.payment_token?.decimals ?? 18;
+  const amount = Number(price) / Math.pow(10, decimals);
+  if (!Number.isFinite(amount) || amount <= 0) return 0;
+  return amount;
+}
+
+function getEthValue(payload) {
+  try {
+    const amount = getSaleAmount(payload);
+    if (amount <= 0) return 0;
+
+    const symbol = (payload.payment_token?.symbol || '').toUpperCase();
+    if (symbol === 'ETH' || symbol === 'WETH') {
+      return amount;
+    }
+
+    const tokenEth = Number(payload.payment_token?.eth_price);
+    if (Number.isFinite(tokenEth) && tokenEth > 0) {
+      return amount * tokenEth;
+    }
+
+    // Stablecoins / unknown: convert via USD → ETH
+    if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
+      return ethPrice > 0 ? amount / ethPrice : 0;
+    }
+
+    const tokenUsd = Number(payload.payment_token?.usd_price);
+    if (Number.isFinite(tokenUsd) && tokenUsd > 0 && ethPrice > 0) {
+      return (amount * tokenUsd) / ethPrice;
+    }
+
+    return 0;
+  } catch {
+    return 0;
+  }
+}
+
 function getUsdValue(payload) {
   try {
-    // OpenSea item_sold uses sale_price (wei); payment_token.eth_price/usd_price are rates
-    const price = payload.sale_price || payload.total_price || payload.base_price || '0';
-    const decimals = payload.payment_token?.decimals ?? 18;
-    const amount = Number(price) / Math.pow(10, decimals);
-    if (!Number.isFinite(amount) || amount <= 0) return 0;
+    const eth = getEthValue(payload);
+    if (eth > 0) return eth * ethPrice;
+
+    const amount = getSaleAmount(payload);
+    if (amount <= 0) return 0;
 
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
@@ -45,12 +84,7 @@ function getUsdValue(payload) {
       return amount * tokenUsd;
     }
 
-    const tokenEth = Number(payload.payment_token?.eth_price);
-    if (Number.isFinite(tokenEth) && tokenEth > 0) {
-      return amount * tokenEth * ethPrice;
-    }
-
-    return amount * ethPrice;
+    return 0;
   } catch {
     return 0;
   }
@@ -85,9 +119,14 @@ function processSale(event) {
 
     const entry = sweeps.get(key);
 
+    const eth = getEthValue(payload);
+    // Ignore dust buys at or under the ETH floor
+    if (eth <= MIN_ETH_PER_NFT) return;
+
     const usd = getUsdValue(payload);
     entry.sales.push({
       timestamp: now,
+      eth,
       usd,
       tokenId: payload.item?.token_id || payload.item?.nft_id,
       tx: payload.transaction?.hash
@@ -96,18 +135,19 @@ function processSale(event) {
     entry.sales = entry.sales.filter(s => now - s.timestamp < WINDOW_MS);
 
     const count = entry.sales.length;
+    const totalEth = entry.sales.reduce((sum, s) => sum + (s.eth || 0), 0);
     const totalUsd = entry.sales.reduce((sum, s) => sum + (s.usd || 0), 0);
 
-    if (count >= MIN_NFTS && totalUsd >= MIN_USD && (now - entry.lastAlert > ALERT_COOLDOWN)) {
+    if (count >= MIN_NFTS && (now - entry.lastAlert > ALERT_COOLDOWN)) {
       entry.lastAlert = now;
-      sendAlert({ buyer, collection, collectionName, image, count, totalUsd });
+      sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd });
     }
   } catch (err) {
     console.error('Process error:', err.message);
   }
 }
 
-async function sendAlert({ buyer, collection, collectionName, image, count, totalUsd }) {
+async function sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd }) {
   try {
     const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
     if (!channel) return;
@@ -124,17 +164,17 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
       .addFields(
         { name: 'Project', value: `[${collectionName}](${collectionLink})`, inline: true },
         { name: 'NFTs Swept', value: `**${count}**`, inline: true },
-        { name: 'Total Value', value: `**$${totalUsd.toFixed(2)}**`, inline: true },
+        { name: 'Total Value', value: `**${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})**`, inline: true },
         { name: 'Wallet', value: `[${short}](${openseaLink})`, inline: false },
         { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false }
       )
       .setTimestamp()
-      .setFooter({ text: 'NFT Sweep Bot • 10 min window' });
+      .setFooter({ text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 10 min window` });
 
     if (image) embed.setThumbnail(image);
 
     await channel.send({ embeds: [embed] });
-    console.log(`Alert → ${collectionName} | ${count} NFTs | $${totalUsd.toFixed(2)}`);
+    console.log(`Alert → ${collectionName} | ${count} NFTs | ${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})`);
   } catch (err) {
     console.error('Send alert error:', err.message);
   }
