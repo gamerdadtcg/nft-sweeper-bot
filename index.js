@@ -21,7 +21,7 @@ async function updateEthPrice() {
     const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
     const data = await res.json();
     ethPrice = data.ethereum?.usd || ethPrice;
-    console.log(`ETH price: \[ {ethPrice}`);
+    console.log(`ETH price: $${ethPrice}`);
   } catch (err) {
     console.error('ETH price error:', err.message);
   }
@@ -29,14 +29,27 @@ async function updateEthPrice() {
 
 function getUsdValue(payload) {
   try {
-    const price = payload.payment_token?.eth_price || payload.total_price || '0';
-    const decimals = payload.payment_token?.decimals || 18;
+    // OpenSea item_sold uses sale_price (wei); payment_token.eth_price/usd_price are rates
+    const price = payload.sale_price || payload.total_price || payload.base_price || '0';
+    const decimals = payload.payment_token?.decimals ?? 18;
     const amount = Number(price) / Math.pow(10, decimals);
+    if (!Number.isFinite(amount) || amount <= 0) return 0;
 
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
       return amount;
     }
+
+    const tokenUsd = Number(payload.payment_token?.usd_price);
+    if (Number.isFinite(tokenUsd) && tokenUsd > 0) {
+      return amount * tokenUsd;
+    }
+
+    const tokenEth = Number(payload.payment_token?.eth_price);
+    if (Number.isFinite(tokenEth) && tokenEth > 0) {
+      return amount * tokenEth * ethPrice;
+    }
+
     return amount * ethPrice;
   } catch {
     return 0;
@@ -48,11 +61,13 @@ function processSale(event) {
   try {
     const payload = event.payload || event;
 
+    // For listing fills (typical floor sweeps), taker is the buyer; maker is the seller.
     const buyer = (
-      payload.maker?.address ||
-      payload.to_account?.address ||
+      payload.taker?.address ||
       payload.winner_account?.address ||
-      payload.buyer?.address
+      payload.to_account?.address ||
+      payload.buyer?.address ||
+      payload.maker?.address
     )?.toLowerCase();
 
     const collection = payload.collection?.slug || payload.item?.collection?.slug;
@@ -61,7 +76,7 @@ function processSale(event) {
 
     if (!buyer || !collection) return;
 
-    const key = `\( {buyer}- \){collection}`;
+    const key = `${buyer}-${collection}`;
     const now = Date.now();
 
     if (!sweeps.has(key)) {
@@ -97,7 +112,7 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
     const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
     if (!channel) return;
 
-    const short = `\( {buyer.slice(0, 6)}... \){buyer.slice(-4)}`;
+    const short = `${buyer.slice(0, 6)}...${buyer.slice(-4)}`;
     const openseaLink = `https://opensea.io/${buyer}`;
     const etherscanLink = `https://etherscan.io/address/${buyer}`;
     const collectionLink = `https://opensea.io/collection/${collection}`;
@@ -107,11 +122,11 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
       .setTitle('🚨 NFT SWEEP DETECTED')
       .setDescription(`**${collectionName}** just got swept`)
       .addFields(
-        { name: 'Project', value: `[\( {collectionName}]( \){collectionLink})`, inline: true },
+        { name: 'Project', value: `[${collectionName}](${collectionLink})`, inline: true },
         { name: 'NFTs Swept', value: `**${count}**`, inline: true },
-        { name: 'Total Value', value: `** \]{totalUsd.toFixed(2)}**`, inline: true },
-        { name: 'Wallet', value: `[\( {short}]( \){openseaLink})`, inline: false },
-        { name: 'Links', value: `[OpenSea](\( {openseaLink}) • [Etherscan]( \){etherscanLink})`, inline: false }
+        { name: 'Total Value', value: `**$${totalUsd.toFixed(2)}**`, inline: true },
+        { name: 'Wallet', value: `[${short}](${openseaLink})`, inline: false },
+        { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false }
       )
       .setTimestamp()
       .setFooter({ text: 'NFT Sweep Bot • 10 min window' });
@@ -140,7 +155,7 @@ async function start() {
     }
   }, 60 * 1000);
 
-  client.once('ready', () => {
+  client.once('clientReady', () => {
     console.log(`Logged in as ${client.user.tag}`);
   });
 
