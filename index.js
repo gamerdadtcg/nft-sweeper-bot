@@ -16,6 +16,9 @@ const WETH_ADDRESSES = new Set([
   '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // Arbitrum
   '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', // Polygon
 ]);
+const BLOCKED_COLLECTIONS = new Set([
+  'courtyard-nft',
+]);
 
 function isWethSale(payload) {
   const symbol = (payload.payment_token?.symbol || '').toUpperCase();
@@ -123,6 +126,7 @@ function processSale(event) {
     const image = payload.item?.metadata?.image_url || payload.collection?.image_url || payload.item?.image_url || null;
 
     if (!buyer || !collection) return;
+    if (BLOCKED_COLLECTIONS.has(collection.toLowerCase())) return;
 
     // Skip WETH sales (usually offer accepts, not floor sweeps)
     if (isWethSale(payload)) return;
