@@ -6,9 +6,23 @@ const fetch = require('node-fetch');
 
 // ========== CONFIG ==========
 const MIN_NFTS = 10;
-const MIN_ETH_PER_NFT = 0.0005; // only count buys worth more than this (ETH)
+const MIN_ETH_PER_NFT = 0.001; // only count buys worth more than this (ETH)
 const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const ALERT_COOLDOWN = 5 * 60 * 1000; // 5 min cooldown
+// Native ETH only — skip WETH (offer accepts flood alerts)
+const WETH_ADDRESSES = new Set([
+  '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // Ethereum
+  '0x4200000000000000000000000000000000000006', // Base / Optimism
+  '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // Arbitrum
+  '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', // Polygon
+]);
+
+function isWethSale(payload) {
+  const symbol = (payload.payment_token?.symbol || '').toUpperCase();
+  if (symbol === 'WETH') return true;
+  const address = (payload.payment_token?.address || '').toLowerCase();
+  return WETH_ADDRESSES.has(address);
+}
 
 // ========== STATE ==========
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
@@ -41,7 +55,7 @@ function getEthValue(payload) {
     if (amount <= 0) return 0;
 
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
-    if (symbol === 'ETH' || symbol === 'WETH') {
+    if (symbol === 'ETH') {
       return amount;
     }
 
@@ -109,6 +123,9 @@ function processSale(event) {
     const image = payload.item?.metadata?.image_url || payload.collection?.image_url || payload.item?.image_url || null;
 
     if (!buyer || !collection) return;
+
+    // Skip WETH sales (usually offer accepts, not floor sweeps)
+    if (isWethSale(payload)) return;
 
     const eth = getEthValue(payload);
     // Ignore dust buys at or under the ETH floor
