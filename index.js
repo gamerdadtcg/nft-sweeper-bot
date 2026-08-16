@@ -3,10 +3,10 @@ const { OpenSeaStreamClient } = require('@opensea/stream-js');
 const { WebSocket } = require('ws');
 
 // ========== CONFIG ==========
-const MIN_NFTS = 10;
+const MIN_NFTS = 5;
 const MIN_ETH_PER_NFT = 0.001; // only count buys worth more than this (ETH)
-const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
-const ALERT_COOLDOWN = 5 * 60 * 1000; // 5 min cooldown
+const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const ALERT_COOLDOWN = 3 * 60 * 1000; // 3 min cooldown
 const ETH_PRICE_INTERVAL_MS = 30 * 60 * 1000; // refresh rarely; sale payloads usually carry usd_price
 const ALLOWED_CHAINS = new Set(['ethereum']); // skip other chains to cut event CPU
 // Native ETH only — skip WETH (offer accepts flood alerts)
@@ -247,7 +247,7 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
         { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false },
       ],
       timestamp: new Date().toISOString(),
-      footer: { text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 10 min window` },
+      footer: { text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 15 min window` },
     };
     if (image) embed.thumbnail = { url: image };
 
