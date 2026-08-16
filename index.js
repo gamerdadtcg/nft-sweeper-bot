@@ -1,14 +1,14 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const { OpenSeaStreamClient } = require('@opensea/stream-js');
 const { WebSocket } = require('ws');
-const fetch = require('node-fetch');
 
 // ========== CONFIG ==========
 const MIN_NFTS = 10;
 const MIN_ETH_PER_NFT = 0.001; // only count buys worth more than this (ETH)
 const WINDOW_MS = 10 * 60 * 1000; // 10 minutes
 const ALERT_COOLDOWN = 5 * 60 * 1000; // 5 min cooldown
+const ETH_PRICE_INTERVAL_MS = 30 * 60 * 1000; // refresh rarely; sale payloads usually carry usd_price
+const ALLOWED_CHAINS = new Set(['ethereum']); // skip other chains to cut event CPU
 // Native ETH only — skip WETH (offer accepts flood alerts)
 const WETH_ADDRESSES = new Set([
   '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // Ethereum
@@ -19,6 +19,12 @@ const WETH_ADDRESSES = new Set([
 const BLOCKED_COLLECTIONS = new Set([
   'courtyard-nft',
 ]);
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
+
+// ========== STATE ==========
+const sweeps = new Map();
+let ethPrice = 3000;
+let discordSend = null; // async ({ embeds }) => void
 
 function isWethSale(payload) {
   const symbol = (payload.payment_token?.symbol || '').toUpperCase();
@@ -27,18 +33,26 @@ function isWethSale(payload) {
   return WETH_ADDRESSES.has(address);
 }
 
-// ========== STATE ==========
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-const sweeps = new Map();
-let ethPrice = 3000;
+function getChain(payload) {
+  const chain = payload.item?.chain?.name || payload.chain?.name || payload.chain;
+  return typeof chain === 'string' ? chain.toLowerCase() : '';
+}
+
+function httpFetch(url, options) {
+  const fetchFn = globalThis.fetch || require('node-fetch');
+  return fetchFn(url, options);
+}
 
 // ========== HELPERS ==========
 async function updateEthPrice() {
   try {
-    const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
+    const res = await httpFetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
     const data = await res.json();
-    ethPrice = data.ethereum?.usd || ethPrice;
-    console.log(`ETH price: $${ethPrice}`);
+    const next = data.ethereum?.usd;
+    if (next && next !== ethPrice) {
+      ethPrice = next;
+      console.log(`ETH price: $${ethPrice}`);
+    }
   } catch (err) {
     console.error('ETH price error:', err.message);
   }
@@ -58,7 +72,9 @@ function getEthValue(payload) {
     if (amount <= 0) return 0;
 
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
-    if (symbol === 'ETH') {
+    const address = (payload.payment_token?.address || '').toLowerCase();
+    // Native ETH (symbol ETH or zero-address payment token)
+    if (symbol === 'ETH' || address === ZERO_ADDRESS || !address) {
       return amount;
     }
 
@@ -67,7 +83,6 @@ function getEthValue(payload) {
       return amount * tokenEth;
     }
 
-    // Stablecoins / unknown: convert via USD → ETH
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
       return ethPrice > 0 ? amount / ethPrice : 0;
     }
@@ -83,28 +98,57 @@ function getEthValue(payload) {
   }
 }
 
-function getUsdValue(payload) {
-  try {
-    const eth = getEthValue(payload);
-    if (eth > 0) return eth * ethPrice;
-
-    const amount = getSaleAmount(payload);
-    if (amount <= 0) return 0;
-
+function getUsdValue(payload, eth) {
+  const tokenUsd = Number(payload.payment_token?.usd_price);
+  const amount = getSaleAmount(payload);
+  if (Number.isFinite(tokenUsd) && tokenUsd > 0 && amount > 0) {
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
+    if (symbol === 'ETH' || symbol === '' || (payload.payment_token?.address || '').toLowerCase() === ZERO_ADDRESS) {
+      return amount * tokenUsd;
+    }
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
       return amount;
     }
-
-    const tokenUsd = Number(payload.payment_token?.usd_price);
-    if (Number.isFinite(tokenUsd) && tokenUsd > 0) {
-      return amount * tokenUsd;
-    }
-
-    return 0;
-  } catch {
-    return 0;
+    return amount * tokenUsd;
   }
+  return (eth || 0) * ethPrice;
+}
+
+// ========== DISCORD (webhook preferred — much cheaper than a full bot gateway) ==========
+async function initDiscord() {
+  const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
+  if (webhookUrl) {
+    discordSend = async ({ embeds }) => {
+      const res = await httpFetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ embeds }),
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`Webhook ${res.status}: ${text.slice(0, 200)}`);
+      }
+    };
+    console.log('Discord: using webhook (low memory mode)');
+    return;
+  }
+
+  // Fallback: full Discord bot (higher RAM / Railway cost)
+  const { Client, GatewayIntentBits } = require('discord.js');
+  const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+  await new Promise((resolve, reject) => {
+    client.once('clientReady', resolve);
+    client.once('error', reject);
+    client.login(process.env.DISCORD_TOKEN).catch(reject);
+  });
+  console.log(`Logged in as ${client.user.tag}`);
+  console.log('Tip: set DISCORD_WEBHOOK_URL to cut Railway memory/cost (no bot gateway needed)');
+
+  discordSend = async ({ embeds }) => {
+    const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
+    if (!channel) throw new Error('Discord channel not found');
+    await channel.send({ embeds });
+  };
 }
 
 // ========== MAIN LOGIC ==========
@@ -112,7 +156,18 @@ function processSale(event) {
   try {
     const payload = event.payload || event;
 
-    // For listing fills (typical floor sweeps), taker is the buyer; maker is the seller.
+    const collection = payload.collection?.slug || payload.item?.collection?.slug;
+    if (!collection) return;
+    if (BLOCKED_COLLECTIONS.has(collection.toLowerCase())) return;
+
+    const chain = getChain(payload);
+    if (chain && !ALLOWED_CHAINS.has(chain)) return;
+
+    if (isWethSale(payload)) return;
+
+    const eth = getEthValue(payload);
+    if (eth <= MIN_ETH_PER_NFT) return;
+
     const buyer = (
       payload.taker?.address ||
       payload.winner_account?.address ||
@@ -120,49 +175,52 @@ function processSale(event) {
       payload.buyer?.address ||
       payload.maker?.address
     )?.toLowerCase();
+    if (!buyer) return;
 
-    const collection = payload.collection?.slug || payload.item?.collection?.slug;
-    const collectionName = payload.collection?.name || payload.item?.collection?.name || collection || 'Unknown';
-    const image = payload.item?.metadata?.image_url || payload.collection?.image_url || payload.item?.image_url || null;
-
-    if (!buyer || !collection) return;
-    if (BLOCKED_COLLECTIONS.has(collection.toLowerCase())) return;
-
-    // Skip WETH sales (usually offer accepts, not floor sweeps)
-    if (isWethSale(payload)) return;
-
-    const eth = getEthValue(payload);
-    // Ignore dust buys at or under the ETH floor
-    if (eth <= MIN_ETH_PER_NFT) return;
-
-    const key = `${buyer}-${collection}`;
+    const key = `${buyer}:${collection}`;
     const now = Date.now();
-
-    if (!sweeps.has(key)) {
-      sweeps.set(key, { sales: [], lastAlert: 0 });
+    let entry = sweeps.get(key);
+    if (!entry) {
+      entry = { sales: [], lastAlert: 0 };
+      sweeps.set(key, entry);
     }
 
-    const entry = sweeps.get(key);
+    // Cache display fields once (avoid re-reading every sale)
+    if (!entry.collectionName) {
+      entry.collectionName = payload.collection?.name || payload.item?.collection?.name || collection;
+      entry.image = payload.item?.metadata?.image_url || payload.collection?.image_url || null;
+    }
 
-    const usd = getUsdValue(payload);
-    entry.sales.push({
-      timestamp: now,
-      eth,
-      usd,
-      tokenId: payload.item?.token_id || payload.item?.nft_id,
-      tx: payload.transaction?.hash
-    });
+    const usd = getUsdValue(payload, eth);
+    entry.sales.push({ t: now, eth, usd });
 
-    entry.sales = entry.sales.filter(s => now - s.timestamp < WINDOW_MS);
+    // Drop expired in place
+    const cutoff = now - WINDOW_MS;
+    if (entry.sales.length > 0 && entry.sales[0].t < cutoff) {
+      entry.sales = entry.sales.filter(s => s.t >= cutoff);
+    }
 
     const count = entry.sales.length;
-    const totalEth = entry.sales.reduce((sum, s) => sum + (s.eth || 0), 0);
-    const totalUsd = entry.sales.reduce((sum, s) => sum + (s.usd || 0), 0);
+    if (count < MIN_NFTS) return;
+    if (now - entry.lastAlert <= ALERT_COOLDOWN) return;
 
-    if (count >= MIN_NFTS && (now - entry.lastAlert > ALERT_COOLDOWN)) {
-      entry.lastAlert = now;
-      sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd });
+    let totalEth = 0;
+    let totalUsd = 0;
+    for (let i = 0; i < count; i++) {
+      totalEth += entry.sales[i].eth;
+      totalUsd += entry.sales[i].usd;
     }
+
+    entry.lastAlert = now;
+    sendAlert({
+      buyer,
+      collection,
+      collectionName: entry.collectionName,
+      image: entry.image,
+      count,
+      totalEth,
+      totalUsd,
+    });
   } catch (err) {
     console.error('Process error:', err.message);
   }
@@ -170,31 +228,30 @@ function processSale(event) {
 
 async function sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd }) {
   try {
-    const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
-    if (!channel) return;
+    if (!discordSend) return;
 
     const short = `${buyer.slice(0, 6)}...${buyer.slice(-4)}`;
     const openseaLink = `https://opensea.io/${buyer}`;
     const etherscanLink = `https://etherscan.io/address/${buyer}`;
     const collectionLink = `https://opensea.io/collection/${collection}`;
 
-    const embed = new EmbedBuilder()
-      .setColor(0x00ff88)
-      .setTitle('🚨 NFT SWEEP DETECTED')
-      .setDescription(`**${collectionName}** just got swept`)
-      .addFields(
+    const embed = {
+      color: 0x00ff88,
+      title: '🚨 NFT SWEEP DETECTED',
+      description: `**${collectionName}** just got swept`,
+      fields: [
         { name: 'Project', value: `[${collectionName}](${collectionLink})`, inline: true },
         { name: 'NFTs Swept', value: `**${count}**`, inline: true },
         { name: 'Total Value', value: `**${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})**`, inline: true },
         { name: 'Wallet', value: `[${short}](${openseaLink})`, inline: false },
-        { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false }
-      )
-      .setTimestamp()
-      .setFooter({ text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 10 min window` });
+        { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false },
+      ],
+      timestamp: new Date().toISOString(),
+      footer: { text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 10 min window` },
+    };
+    if (image) embed.thumbnail = { url: image };
 
-    if (image) embed.setThumbnail(image);
-
-    await channel.send({ embeds: [embed] });
+    await discordSend({ embeds: [embed] });
     console.log(`Alert → ${collectionName} | ${count} NFTs | ${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})`);
   } catch (err) {
     console.error('Send alert error:', err.message);
@@ -205,33 +262,35 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
 async function start() {
   console.log('Starting NFT Sweep Bot...');
 
-  await updateEthPrice();
-  setInterval(updateEthPrice, 5 * 60 * 1000);
+  if (!process.env.DISCORD_WEBHOOK_URL && !process.env.DISCORD_TOKEN) {
+    throw new Error('Set DISCORD_WEBHOOK_URL (recommended) or DISCORD_TOKEN + DISCORD_CHANNEL_ID');
+  }
+  if (!process.env.OPENSEA_API_KEY) {
+    throw new Error('Missing OPENSEA_API_KEY');
+  }
 
+  await updateEthPrice();
+  setInterval(updateEthPrice, ETH_PRICE_INTERVAL_MS);
+
+  // Cleanup idle sweep keys every 2 minutes
   setInterval(() => {
-    const now = Date.now();
+    const cutoff = Date.now() - WINDOW_MS;
     for (const [key, entry] of sweeps.entries()) {
-      entry.sales = entry.sales.filter(s => now - s.timestamp < WINDOW_MS);
+      entry.sales = entry.sales.filter(s => s.t >= cutoff);
       if (entry.sales.length === 0) sweeps.delete(key);
     }
-  }, 60 * 1000);
+  }, 2 * 60 * 1000);
 
-  client.once('clientReady', () => {
-    console.log(`Logged in as ${client.user.tag}`);
-  });
-
-  await client.login(process.env.DISCORD_TOKEN);
+  await initDiscord();
 
   const streamClient = new OpenSeaStreamClient({
     token: process.env.OPENSEA_API_KEY,
-    connectOptions: { transport: WebSocket }
+    connectOptions: { transport: WebSocket },
   });
 
-  streamClient.onItemSold('*', (event) => {
-    processSale(event);
-  });
+  streamClient.onItemSold('*', processSale);
 
-  console.log('Listening for sales across all collections...');
+  console.log('Listening for Ethereum sales (WETH + blocked collections skipped)...');
 }
 
 start().catch(err => {
