@@ -1,9 +1,12 @@
 {
   "name": "nft-sweeper-bot",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "main": "index.js",
   "scripts": {
-    "start": "node --max-old-space-size=128 index.js"
+    "start": "node --max-old-space-size=128 index.js",
+    "sweep:dry": "node scripts/sweep-dry.js",
+    "sweep:digest": "node scripts/sweep-digest.js",
+    "sweep:digest:post": "node scripts/sweep-digest.js --post"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
