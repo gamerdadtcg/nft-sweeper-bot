@@ -5,26 +5,27 @@ const { WebSocket } = require('ws');
 // ========== CONFIG ==========
 const MIN_NFTS = 5;
 const MIN_ETH_PER_NFT = 0.001; // only count buys worth more than this (ETH)
+const MIN_COLLECTION_VOLUME_ETH = 0.25; // only alert if collection 24h volume ≥ this
 const WINDOW_MS = 15 * 60 * 1000; // 15 minutes
 const ALERT_COOLDOWN = 3 * 60 * 1000; // 3 min cooldown
-const ETH_PRICE_INTERVAL_MS = 30 * 60 * 1000; // refresh rarely; sale payloads usually carry usd_price
-const ALLOWED_CHAINS = new Set(['ethereum']); // skip other chains to cut event CPU
-// Native ETH only — skip WETH (offer accepts flood alerts)
+const ETH_PRICE_INTERVAL_MS = 30 * 60 * 1000;
+const VOLUME_CACHE_MS = 10 * 60 * 1000; // reuse collection volume lookups
+const ALLOWED_CHAINS = new Set(['ethereum']);
 const WETH_ADDRESSES = new Set([
   '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2', // Ethereum
   '0x4200000000000000000000000000000000000006', // Base / Optimism
   '0x82af49447d8a07e3bd95bd0d56f35241523fbab1', // Arbitrum
   '0x7ceb23fd6bc0add59e62ac25578270cff1b9f619', // Polygon
 ]);
-const BLOCKED_COLLECTIONS = new Set([
-  'courtyard-nft',
-]);
+const BLOCKED_COLLECTIONS = new Set(['courtyard-nft']);
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 
 // ========== STATE ==========
 const sweeps = new Map();
+const collectionVolumeCache = new Map(); // slug -> { eth, checkedAt }
+const streamVolume24h = new Map(); // slug -> { sales: [{ t, eth }] }
 let ethPrice = 3000;
-let discordSend = null; // async ({ embeds }) => void
+let discordSend = null;
 
 function isWethSale(payload) {
   const symbol = (payload.payment_token?.symbol || '').toUpperCase();
@@ -43,7 +44,6 @@ function httpFetch(url, options) {
   return fetchFn(url, options);
 }
 
-// ========== HELPERS ==========
 async function updateEthPrice() {
   try {
     const res = await httpFetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
@@ -73,15 +73,10 @@ function getEthValue(payload) {
 
     const symbol = (payload.payment_token?.symbol || '').toUpperCase();
     const address = (payload.payment_token?.address || '').toLowerCase();
-    // Native ETH (symbol ETH or zero-address payment token)
-    if (symbol === 'ETH' || address === ZERO_ADDRESS || !address) {
-      return amount;
-    }
+    if (symbol === 'ETH' || address === ZERO_ADDRESS || !address) return amount;
 
     const tokenEth = Number(payload.payment_token?.eth_price);
-    if (Number.isFinite(tokenEth) && tokenEth > 0) {
-      return amount * tokenEth;
-    }
+    if (Number.isFinite(tokenEth) && tokenEth > 0) return amount * tokenEth;
 
     if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
       return ethPrice > 0 ? amount / ethPrice : 0;
@@ -91,7 +86,6 @@ function getEthValue(payload) {
     if (Number.isFinite(tokenUsd) && tokenUsd > 0 && ethPrice > 0) {
       return (amount * tokenUsd) / ethPrice;
     }
-
     return 0;
   } catch {
     return 0;
@@ -106,15 +100,64 @@ function getUsdValue(payload, eth) {
     if (symbol === 'ETH' || symbol === '' || (payload.payment_token?.address || '').toLowerCase() === ZERO_ADDRESS) {
       return amount * tokenUsd;
     }
-    if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') {
-      return amount;
-    }
+    if (symbol === 'USDC' || symbol === 'USDT' || symbol === 'DAI') return amount;
     return amount * tokenUsd;
   }
   return (eth || 0) * ethPrice;
 }
 
-// ========== DISCORD (webhook preferred — much cheaper than a full bot gateway) ==========
+function trackStreamVolume(collection, eth, now = Date.now()) {
+  let entry = streamVolume24h.get(collection);
+  if (!entry) {
+    entry = { sales: [] };
+    streamVolume24h.set(collection, entry);
+  }
+  entry.sales.push({ t: now, eth });
+  const cutoff = now - 24 * 60 * 60 * 1000;
+  entry.sales = entry.sales.filter((s) => s.t >= cutoff);
+}
+
+function getStreamVolume24h(collection) {
+  const entry = streamVolume24h.get(collection);
+  if (!entry) return 0;
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  entry.sales = entry.sales.filter((s) => s.t >= cutoff);
+  let total = 0;
+  for (const s of entry.sales) total += s.eth;
+  return total;
+}
+
+/** Collection 24h volume in ETH. OpenSea stats first; stream tally as fallback. */
+async function getCollectionVolumeEth(slug) {
+  const cached = collectionVolumeCache.get(slug);
+  if (cached && Date.now() - cached.checkedAt < VOLUME_CACHE_MS) return cached.eth;
+
+  let volumeEth = null;
+  try {
+    const res = await httpFetch(
+      `https://api.opensea.io/api/v2/collections/${encodeURIComponent(slug)}/stats`,
+      {
+        headers: {
+          Accept: 'application/json',
+          'X-API-KEY': process.env.OPENSEA_API_KEY,
+        },
+      }
+    );
+    if (res.ok) {
+      const data = await res.json();
+      const s = data.total || data.stats || data;
+      const raw = Number(s.one_day_volume ?? s.volume_24h ?? s.one_day?.volume);
+      if (Number.isFinite(raw) && raw >= 0) volumeEth = raw;
+    }
+  } catch (err) {
+    console.warn(`Volume lookup ${slug}: ${err.message}`);
+  }
+
+  if (volumeEth == null) volumeEth = getStreamVolume24h(slug);
+  collectionVolumeCache.set(slug, { eth: volumeEth, checkedAt: Date.now() });
+  return volumeEth;
+}
+
 async function initDiscord() {
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL;
   if (webhookUrl) {
@@ -133,7 +176,6 @@ async function initDiscord() {
     return;
   }
 
-  // Fallback: full Discord bot (higher RAM / Railway cost)
   const { Client, GatewayIntentBits } = require('discord.js');
   const client = new Client({ intents: [GatewayIntentBits.Guilds] });
   await new Promise((resolve, reject) => {
@@ -142,7 +184,7 @@ async function initDiscord() {
     client.login(process.env.DISCORD_TOKEN).catch(reject);
   });
   console.log(`Logged in as ${client.user.tag}`);
-  console.log('Tip: set DISCORD_WEBHOOK_URL to cut Railway memory/cost (no bot gateway needed)');
+  console.log('Tip: set DISCORD_WEBHOOK_URL to cut Railway memory/cost');
 
   discordSend = async ({ embeds }) => {
     const channel = await client.channels.fetch(process.env.DISCORD_CHANNEL_ID);
@@ -151,8 +193,7 @@ async function initDiscord() {
   };
 }
 
-// ========== MAIN LOGIC ==========
-function processSale(event) {
+async function processSale(event) {
   try {
     const payload = event.payload || event;
 
@@ -162,7 +203,6 @@ function processSale(event) {
 
     const chain = getChain(payload);
     if (chain && !ALLOWED_CHAINS.has(chain)) return;
-
     if (isWethSale(payload)) return;
 
     const eth = getEthValue(payload);
@@ -177,27 +217,26 @@ function processSale(event) {
     )?.toLowerCase();
     if (!buyer) return;
 
-    const key = `${buyer}:${collection}`;
     const now = Date.now();
+    trackStreamVolume(collection, eth, now);
+
+    const key = `${buyer}:${collection}`;
     let entry = sweeps.get(key);
     if (!entry) {
       entry = { sales: [], lastAlert: 0 };
       sweeps.set(key, entry);
     }
 
-    // Cache display fields once (avoid re-reading every sale)
     if (!entry.collectionName) {
       entry.collectionName = payload.collection?.name || payload.item?.collection?.name || collection;
       entry.image = payload.item?.metadata?.image_url || payload.collection?.image_url || null;
     }
 
-    const usd = getUsdValue(payload, eth);
-    entry.sales.push({ t: now, eth, usd });
+    entry.sales.push({ t: now, eth, usd: getUsdValue(payload, eth) });
 
-    // Drop expired in place
     const cutoff = now - WINDOW_MS;
-    if (entry.sales.length > 0 && entry.sales[0].t < cutoff) {
-      entry.sales = entry.sales.filter(s => s.t >= cutoff);
+    if (entry.sales.length && entry.sales[0].t < cutoff) {
+      entry.sales = entry.sales.filter((s) => s.t >= cutoff);
     }
 
     const count = entry.sales.length;
@@ -211,8 +250,16 @@ function processSale(event) {
       totalUsd += entry.sales[i].usd;
     }
 
+    const volumeEth = await getCollectionVolumeEth(collection);
+    if (volumeEth < MIN_COLLECTION_VOLUME_ETH) {
+      console.log(
+        `Skip ${entry.collectionName}: 24h vol ${volumeEth.toFixed(4)} ETH < ${MIN_COLLECTION_VOLUME_ETH}`
+      );
+      return;
+    }
+
     entry.lastAlert = now;
-    sendAlert({
+    await sendAlert({
       buyer,
       collection,
       collectionName: entry.collectionName,
@@ -220,13 +267,14 @@ function processSale(event) {
       count,
       totalEth,
       totalUsd,
+      volumeEth,
     });
   } catch (err) {
     console.error('Process error:', err.message);
   }
 }
 
-async function sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd }) {
+async function sendAlert({ buyer, collection, collectionName, image, count, totalEth, totalUsd, volumeEth }) {
   try {
     if (!discordSend) return;
 
@@ -243,22 +291,26 @@ async function sendAlert({ buyer, collection, collectionName, image, count, tota
         { name: 'Project', value: `[${collectionName}](${collectionLink})`, inline: true },
         { name: 'NFTs Swept', value: `**${count}**`, inline: true },
         { name: 'Total Value', value: `**${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})**`, inline: true },
+        { name: '24h Volume', value: `**${Number(volumeEth || 0).toFixed(2)} ETH**`, inline: true },
         { name: 'Wallet', value: `[${short}](${openseaLink})`, inline: false },
         { name: 'Links', value: `[OpenSea](${openseaLink}) • [Etherscan](${etherscanLink})`, inline: false },
       ],
       timestamp: new Date().toISOString(),
-      footer: { text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • 15 min window` },
+      footer: {
+        text: `NFT Sweep Bot • ≥${MIN_NFTS} buys > ${MIN_ETH_PER_NFT} ETH • coll vol ≥ ${MIN_COLLECTION_VOLUME_ETH} ETH • 15 min`,
+      },
     };
     if (image) embed.thumbnail = { url: image };
 
     await discordSend({ embeds: [embed] });
-    console.log(`Alert → ${collectionName} | ${count} NFTs | ${totalEth.toFixed(4)} ETH ($${totalUsd.toFixed(2)})`);
+    console.log(
+      `Alert → ${collectionName} | ${count} NFTs | ${totalEth.toFixed(4)} ETH | 24h vol ${Number(volumeEth || 0).toFixed(2)} ETH`
+    );
   } catch (err) {
     console.error('Send alert error:', err.message);
   }
 }
 
-// ========== START ==========
 async function start() {
   console.log('Starting NFT Sweep Bot...');
 
@@ -272,12 +324,16 @@ async function start() {
   await updateEthPrice();
   setInterval(updateEthPrice, ETH_PRICE_INTERVAL_MS);
 
-  // Cleanup idle sweep keys every 2 minutes
   setInterval(() => {
     const cutoff = Date.now() - WINDOW_MS;
+    const dayCutoff = Date.now() - 24 * 60 * 60 * 1000;
     for (const [key, entry] of sweeps.entries()) {
-      entry.sales = entry.sales.filter(s => s.t >= cutoff);
+      entry.sales = entry.sales.filter((s) => s.t >= cutoff);
       if (entry.sales.length === 0) sweeps.delete(key);
+    }
+    for (const [slug, entry] of streamVolume24h.entries()) {
+      entry.sales = entry.sales.filter((s) => s.t >= dayCutoff);
+      if (entry.sales.length === 0) streamVolume24h.delete(slug);
     }
   }, 2 * 60 * 1000);
 
@@ -288,12 +344,16 @@ async function start() {
     connectOptions: { transport: WebSocket },
   });
 
-  streamClient.onItemSold('*', processSale);
+  streamClient.onItemSold('*', (event) => {
+    processSale(event).catch((err) => console.error('Sale handler:', err.message));
+  });
 
-  console.log('Listening for Ethereum sales (WETH + blocked collections skipped)...');
+  console.log(
+    `Listening for Ethereum sales (alerts need ≥${MIN_NFTS} buys + collection 24h vol ≥ ${MIN_COLLECTION_VOLUME_ETH} ETH)...`
+  );
 }
 
-start().catch(err => {
+start().catch((err) => {
   console.error('Fatal error:', err);
   process.exit(1);
 });
